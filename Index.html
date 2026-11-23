@@ -1,0 +1,1957 @@
+import React, { useState, useMemo, useEffect, useRef } from "react";
+import * as XLSX from "xlsx";
+
+/* ---------------------------------------------------------------- */
+/* SUPABASE CONNECTION                                               */
+/* Paste your Project URL and anon public key below (Settings > API  */
+/* in your Supabase dashboard). Until you do, the app keeps running  */
+/* on shared demo storage exactly as before — nothing breaks.        */
+/* ---------------------------------------------------------------- */
+
+const SUPABASE_URL = "https://jptnsivnebefegqaukbz.supabase.co"; // TODO: paste your Project URL
+const SUPABASE_ANON_KEY = "sb_publishable_ilSW0Kf7_SIrBApDm0ql6Q_n-6B1xca"; // TODO: paste your anon public key
+
+const SUPABASE_CONFIGURED =
+  !SUPABASE_URL.includes("YOUR-PROJECT") && !SUPABASE_ANON_KEY.includes("YOUR-ANON");
+
+// Set to true if you want people to sign in and have Admin/Supervisor/Viewer
+// roles enforced. Set to false (current setting) so everyone who opens the
+// app gets full access immediately - no login screen at all.
+const REQUIRE_LOGIN = false;
+
+// module key -> { table, map: { localFieldKey: dbColumnName } }
+const SUPA_TABLES = {
+  shifts: { table: "shifts", map: { name: "name", start: "start_time", end: "end_time", employees: "employees", coverage: "coverage" } },
+  areas: { table: "areas", map: { id: "area_code", building: "building", floor: "floor", name: "name", type: "type", size: "size", frequency: "frequency", responsible: "responsible" } },
+  tasks: { table: "tasks", map: { id: "task_code", name: "name", area: "area", frequency: "frequency", method: "method", chemical: "chemical", equipment: "equipment", standardTime: "standard_time" } },
+  allocations: { table: "allocations", map: { date: "date", shift: "shift", employee: "employee", area: "area", task: "task", status: "status", remarks: "remarks" } },
+  checklist: { table: "checklist", map: { date: "date", area: "area", task: "task", checkedBy: "checked_by", status: "status", remarks: "remarks" } },
+  deepCleaning: { table: "deep_cleaning", map: { area: "area", schedule: "schedule", plannedDate: "planned_date", stage: "stage", assignedTo: "assigned_to", remarks: "remarks" } },
+  consumables: { table: "consumables", map: { item: "item", category: "category", opening: "opening", received: "received", issued: "issued", closing: "closing", min: "min_stock", reorder: "reorder_level" } },
+  chemicals: { table: "chemicals", map: { name: "name", brand: "brand", application: "application", dilution: "dilution", ph: "ph", storage: "storage", stock: "stock", minLevel: "min_level", expiry: "expiry" } },
+  stockIn: { table: "stock_in", map: { date: "date", supplier: "supplier", invoice: "invoice", item: "item", qty: "qty", unit: "unit", batch: "batch", expiry: "expiry", receivedBy: "received_by" } },
+  stockOut: { table: "stock_out", map: { date: "date", item: "item", qty: "qty", issuedTo: "issued_to", department: "department", purpose: "purpose", issuedBy: "issued_by" } },
+  purchase: { table: "purchase", map: { item: "item", qty: "qty", status: "status", supplier: "supplier", cost: "cost", requestedBy: "requested_by" } },
+  equipment: { table: "equipment", map: { id: "equipment_code", name: "name", brand: "brand", model: "model", serial: "serial", location: "location", assignedTo: "assigned_to", condition: "condition", warranty: "warranty" } },
+  maintenance: { table: "maintenance", map: { equipment: "equipment", issue: "issue", serviceDate: "service_date", technician: "technician", cost: "cost", nextService: "next_service", status: "status" } },
+  training: { table: "training", map: { employee: "employee", topic: "topic", status: "status", date: "date" } },
+  waste: { table: "waste", map: { date: "date", type: "type", qty: "qty", area: "area", collectedBy: "collected_by" } },
+  users: { table: "app_users", map: { username: "username", name: "name", role: "role", status: "status", email: "email" } },
+  roles: { table: "roles", map: { name: "name", permissions: "permissions" } },
+  staff: { table: "staff", map: { id: "employee_code", name: "name", designation: "designation", department: "department", joiningDate: "joining_date", contact: "contact", shift: "shift", area: "area", status: "status", photo: "photo" } },
+  attendance: { table: "attendance", map: { date: "date", employee: "employee", status: "status", checkIn: "check_in", checkOut: "check_out" } },
+  complaints: { table: "complaints", map: { id: "complaint_code", area: "area", type: "type", priority: "priority", assignedEmployee: "assigned_employee", status: "status", raisedDate: "raised_date", remarks: "remarks" } },
+};
+
+async function supaFetch(path, options = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method: options.method || "GET",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.prefer ? { Prefer: options.prefer } : {}),
+    },
+    body: options.body,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Supabase request failed (${res.status}): ${text}`);
+  }
+  if (res.status === 204) return null;
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+function toRemote(cfg, row) {
+  const payload = {};
+  Object.entries(cfg.map).forEach(([localKey, col]) => {
+    const v = row[localKey];
+    payload[col] = v === "" || v === undefined ? null : v;
+  });
+  return payload;
+}
+function toLocal(cfg, remoteRow) {
+  const local = { _dbId: remoteRow.id };
+  Object.entries(cfg.map).forEach(([localKey, col]) => { local[localKey] = remoteRow[col]; });
+  return local;
+}
+
+async function loadModuleTable(moduleKey) {
+  const cfg = SUPA_TABLES[moduleKey];
+  const rows = await supaFetch(`${cfg.table}?select=*&order=created_at.asc`);
+  return rows.map(r => toLocal(cfg, r));
+}
+
+// Diffs oldRows -> newRows for one module and pushes inserts/updates/deletes
+// to Supabase. Returns any newly-inserted rows so the caller can attach
+// their generated database ids back into local state.
+async function syncModuleTable(moduleKey, oldRows, newRows) {
+  const cfg = SUPA_TABLES[moduleKey];
+  const oldById = new Map(oldRows.filter(r => r._dbId).map(r => [r._dbId, r]));
+  const newWithId = newRows.filter(r => r._dbId);
+  const newIds = new Set(newWithId.map(r => r._dbId));
+  const toInsert = newRows.filter(r => !r._dbId);
+  const toDelete = oldRows.filter(r => r._dbId && !newIds.has(r._dbId));
+  const toUpdate = newWithId.filter(r => {
+    const old = oldById.get(r._dbId);
+    return old && JSON.stringify(toRemote(cfg, old)) !== JSON.stringify(toRemote(cfg, r));
+  });
+
+  const inserted = [];
+  for (const row of toInsert) {
+    const [saved] = await supaFetch(cfg.table, { method: "POST", body: JSON.stringify(toRemote(cfg, row)), prefer: "return=representation" });
+    inserted.push({ tempRef: row, dbId: saved.id });
+  }
+  for (const row of toUpdate) {
+    await supaFetch(`${cfg.table}?id=eq.${row._dbId}`, { method: "PATCH", body: JSON.stringify(toRemote(cfg, row)) });
+  }
+  for (const row of toDelete) {
+    await supaFetch(`${cfg.table}?id=eq.${row._dbId}`, { method: "DELETE" });
+  }
+  return inserted;
+}
+
+/* ---------------------------------------------------------------- */
+/* AUTH (Supabase Auth REST API)                                     */
+/* ---------------------------------------------------------------- */
+
+const AUTH_STORAGE_KEY = "shiftline-session-v1";
+
+// Roles allowed to see each nav key. Admin (null) sees everything,
+// including Settings. Unknown/unlisted roles fall back to dashboard-only.
+const ROLE_ACCESS = {
+  Admin: null,
+  Supervisor: ["dashboard", "staff", "attendance", "shifts", "areas", "tasks", "allocations", "checklist", "deepCleaning", "complaints", "report-daily", "report-weekly", "report-monthly"],
+  Viewer: ["dashboard", "report-daily", "report-weekly", "report-monthly"],
+};
+function canAccess(role, key) {
+  const list = ROLE_ACCESS[role];
+  if (list === null) return true; // Admin
+  if (list === undefined) return key === "dashboard"; // unknown role, least privilege
+  return list.includes(key);
+}
+function canEditRole(role) {
+  return role === "Admin" || role === "Supervisor";
+}
+
+async function authFetch(path, body, accessToken) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error_description || json.msg || json.error || `Auth request failed (${res.status})`);
+  return json;
+}
+
+async function fetchRoleForEmail(email) {
+  const rows = await supaFetch(`app_users?email=eq.${encodeURIComponent(email)}&select=*&limit=1`);
+  return rows && rows[0] ? rows[0] : null;
+}
+
+import {
+  Home, HardHat, MapPin, Sparkles, AlertTriangle, Package, Wrench,
+  GraduationCap, Trash2, BarChart3, Settings, Menu, X, Plus, Pencil,
+  Search, ChevronDown, ChevronRight, CalendarDays, CheckCircle2,
+  Clock, Building2, Trash, Save, ArrowRight, LogOut, Lock, Mail, ShieldCheck
+} from "lucide-react";
+
+/* ---------------------------------------------------------------- */
+/* SEED DATA                                                         */
+/* ---------------------------------------------------------------- */
+
+function localDateString(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+const TODAY = localDateString(0);
+const YDAY = localDateString(-1);
+
+let seedStaff = [
+  { id: "EMP001", name: "Ramesh Kumar", designation: "Housekeeping Supervisor", department: "Operations", joiningDate: "2021-03-15", contact: "98450 11234", shift: "Shift 1", area: "Ground Floor Lobby", status: "Active" },
+  { id: "EMP002", name: "Suresh Patil", designation: "Cleaner", department: "Operations", joiningDate: "2022-01-10", contact: "98450 22345", shift: "Shift 1", area: "Restrooms - 2nd Floor", status: "Active" },
+  { id: "EMP003", name: "Anita Sharma", designation: "Cleaner", department: "Operations", joiningDate: "2022-06-01", contact: "98450 33456", shift: "Shift 2", area: "Cafeteria", status: "Active" },
+  { id: "EMP004", name: "Geeta Devi", designation: "Cleaner", department: "Operations", joiningDate: "2023-02-20", contact: "98450 44567", shift: "General", area: "Office Area", status: "Active" },
+  { id: "EMP005", name: "Manoj Yadav", designation: "Machine Operator", department: "Operations", joiningDate: "2020-11-05", contact: "98450 55678", shift: "Shift 1", area: "Parking & Corridors", status: "On Leave" },
+  { id: "EMP006", name: "Priya Singh", designation: "Housekeeping Executive", department: "Admin", joiningDate: "2021-08-12", contact: "98450 66789", shift: "General", area: "Reception", status: "Active" },
+];
+
+let seedShifts = [
+  { name: "Shift 1", start: "06:30", end: "15:30", employees: 3, coverage: "Ground & 1st Floor" },
+  { name: "Shift 2", start: "13:30", end: "21:30", employees: 1, coverage: "Cafeteria & Upper Floors" },
+  { name: "General", start: "08:30", end: "17:30", employees: 2, coverage: "Admin & Reception" },
+];
+
+let seedAreas = [
+  { id: "AR001", building: "Building A", floor: "Ground", name: "Ground Floor Lobby", type: "Lobby", size: 1200, frequency: "Daily", responsible: "Ramesh Kumar" },
+  { id: "AR002", building: "Building A", floor: "2nd", name: "Restrooms - 2nd Floor", type: "Restroom", size: 300, frequency: "Hourly", responsible: "Suresh Patil" },
+  { id: "AR003", building: "Building A", floor: "1st", name: "Cafeteria", type: "Cafeteria", size: 800, frequency: "Daily", responsible: "Anita Sharma" },
+  { id: "AR004", building: "Building B", floor: "3rd", name: "Office Area", type: "Office", size: 2000, frequency: "Daily", responsible: "Geeta Devi" },
+  { id: "AR005", building: "Building A", floor: "Ground", name: "Parking & Corridors", type: "Parking", size: 3000, frequency: "Weekly", responsible: "Manoj Yadav" },
+];
+
+let seedChemicals = [
+  { name: "Floor Cleaner", brand: "Taski R2", application: "General floor cleaning", dilution: "1:40", ph: "8.5", storage: "Store Room A", stock: 22, minLevel: 10, expiry: "2027-01-15" },
+  { name: "Glass Cleaner", brand: "Taski R5", application: "Glass & glazing", dilution: "1:20", ph: "9", storage: "Store Room A", stock: 8, minLevel: 10, expiry: "2027-03-01" },
+  { name: "Toilet Cleaner", brand: "Ecolab", application: "Restroom sanitation", dilution: "Ready to use", ph: "1.5", storage: "Store Room B", stock: 15, minLevel: 8, expiry: "2026-12-20" },
+  { name: "Disinfectant", brand: "Ecolab Oasis", application: "Surface disinfection", dilution: "1:64", ph: "7", storage: "Store Room B", stock: 6, minLevel: 10, expiry: "2027-02-10" },
+];
+
+let seedEquipment = [
+  { id: "EQ001", name: "Scrubber Dryer", brand: "Karcher", model: "BD 50/50", serial: "KC-9981", location: "Ground Floor Lobby", assignedTo: "Ramesh Kumar", condition: "Good", warranty: "2027-04-01" },
+  { id: "EQ002", name: "Single-disc Machine", brand: "Numatic", model: "NuSpeed", serial: "NU-2231", location: "Office Area", assignedTo: "Geeta Devi", condition: "Fair", warranty: "2026-10-15" },
+  { id: "EQ003", name: "Vacuum Cleaner", brand: "Karcher", model: "T 12/1", serial: "KC-4471", location: "Cafeteria", assignedTo: "Anita Sharma", condition: "Good", warranty: "2027-06-20" },
+  { id: "EQ004", name: "Wet & Dry Vacuum", brand: "Numatic", model: "WV 570", serial: "NU-6620", location: "Restrooms - 2nd Floor", assignedTo: "Suresh Patil", condition: "Needs Repair", warranty: "2026-09-30" },
+  { id: "EQ005", name: "High-pressure Machine", brand: "Karcher", model: "HD 6/15", serial: "KC-7742", location: "Parking & Corridors", assignedTo: "Manoj Yadav", condition: "Good", warranty: "2027-01-05" },
+];
+
+let seedTasks = [
+  { id: "TSK001", name: "Lobby Floor Mopping", area: "Ground Floor Lobby", frequency: "Daily", method: "Wet mopping", chemical: "Floor Cleaner", equipment: "Scrubber Dryer", standardTime: 30 },
+  { id: "TSK002", name: "Restroom Deep Clean", area: "Restrooms - 2nd Floor", frequency: "Hourly", method: "Scrub & sanitize", chemical: "Toilet Cleaner", equipment: "Wet & Dry Vacuum", standardTime: 20 },
+  { id: "TSK003", name: "Cafeteria Cleaning", area: "Cafeteria", frequency: "Daily", method: "Sweep & mop", chemical: "Floor Cleaner", equipment: "Vacuum Cleaner", standardTime: 45 },
+  { id: "TSK004", name: "Glass & Window Cleaning", area: "Office Area", frequency: "Weekly", method: "Wipe & squeegee", chemical: "Glass Cleaner", equipment: "Single-disc Machine", standardTime: 60 },
+  { id: "TSK005", name: "Corridor Sweeping", area: "Parking & Corridors", frequency: "Daily", method: "Dry sweep", chemical: "Disinfectant", equipment: "High-pressure Machine", standardTime: 40 },
+];
+
+let seedAllocations = [
+  { date: TODAY, shift: "Shift 1", employee: "Ramesh Kumar", area: "Ground Floor Lobby", task: "Lobby Floor Mopping", status: "Completed", remarks: "" },
+  { date: TODAY, shift: "Shift 1", employee: "Suresh Patil", area: "Restrooms - 2nd Floor", task: "Restroom Deep Clean", status: "In Progress", remarks: "" },
+  { date: TODAY, shift: "Shift 2", employee: "Anita Sharma", area: "Cafeteria", task: "Cafeteria Cleaning", status: "Pending", remarks: "Starts 1:30 PM" },
+  { date: TODAY, shift: "General", employee: "Geeta Devi", area: "Office Area", task: "Glass & Window Cleaning", status: "Pending", remarks: "" },
+];
+
+let seedChecklist = [
+  { date: TODAY, area: "Ground Floor Lobby", task: "Lobby Floor Mopping", checkedBy: "Ramesh Kumar", status: "OK", remarks: "" },
+  { date: TODAY, area: "Restrooms - 2nd Floor", task: "Restroom Deep Clean", checkedBy: "Suresh Patil", status: "Pending", remarks: "" },
+];
+
+let seedDeepCleaning = [
+  { area: "Cafeteria", schedule: "Monthly", plannedDate: "2026-09-12", stage: "Assigned", assignedTo: "Anita Sharma", remarks: "" },
+  { area: "Office Area", schedule: "Quarterly", plannedDate: "2026-09-25", stage: "Planned", assignedTo: "Geeta Devi", remarks: "" },
+  { area: "Restrooms - 2nd Floor", schedule: "Weekly", plannedDate: "2026-09-06", stage: "Verified", assignedTo: "Suresh Patil", remarks: "Passed inspection" },
+];
+
+let seedComplaints = [
+  { id: "CMP001", area: "Restrooms - 2nd Floor", type: "Cleanliness", priority: "High", assignedEmployee: "Suresh Patil", status: "In Progress", raisedDate: TODAY, remarks: "Reported by floor manager" },
+  { id: "CMP002", area: "Cafeteria", type: "Odor", priority: "Medium", assignedEmployee: "Anita Sharma", status: "New", raisedDate: TODAY, remarks: "" },
+  { id: "CMP003", area: "Office Area", type: "Damage", priority: "Low", assignedEmployee: "Geeta Devi", status: "Closed", raisedDate: YDAY, remarks: "Chair leg fixed" },
+];
+
+let seedConsumables = [
+  { item: "Toilet Paper", category: "Paper", opening: 120, received: 0, issued: 40, closing: 80, min: 30, reorder: 40 },
+  { item: "Hand Soap", category: "Chemical", opening: 25, received: 10, issued: 8, closing: 27, min: 10, reorder: 15 },
+  { item: "Garbage Bags", category: "Other", opening: 15, received: 0, issued: 10, closing: 5, min: 10, reorder: 20 },
+  { item: "PPE Gloves (box)", category: "PPE", opening: 6, received: 0, issued: 1, closing: 5, min: 5, reorder: 8 },
+];
+
+let seedStockIn = [
+  { date: YDAY, supplier: "CleanCo Supplies", invoice: "INV-4521", item: "Hand Soap", qty: 10, unit: "Ltr", batch: "B220", expiry: "2027-05-01", receivedBy: "Priya Singh" },
+];
+
+let seedStockOut = [
+  { date: TODAY, item: "Toilet Paper", qty: 40, issuedTo: "Suresh Patil", department: "Operations", purpose: "Restroom restock", issuedBy: "Ramesh Kumar" },
+];
+
+let seedPurchase = [
+  { item: "Glass Cleaner (Taski R5)", qty: 12, status: "Approved", supplier: "Taski India", cost: 6600, requestedBy: "Ramesh Kumar" },
+  { item: "Garbage Bags", qty: 50, status: "Requested", supplier: "CleanCo Supplies", cost: 2500, requestedBy: "Priya Singh" },
+];
+
+let seedMaintenance = [
+  { equipment: "Wet & Dry Vacuum", issue: "Motor noise", serviceDate: "2026-09-02", technician: "Vinod (Numatic Svc)", cost: 1800, nextService: "2026-09-10", status: "In Progress" },
+  { equipment: "Single-disc Machine", issue: "Routine service", serviceDate: "2026-08-15", technician: "Karcher Care", cost: 900, nextService: "2026-11-15", status: "Completed" },
+];
+
+let seedTraining = [
+  { employee: "Ramesh Kumar", topic: "Chemical Safety", status: "Completed", date: "2026-06-10" },
+  { employee: "Suresh Patil", topic: "PPE", status: "Completed", date: "2026-06-10" },
+  { employee: "Suresh Patil", topic: "Fire Safety", status: "Pending", date: "" },
+  { employee: "Anita Sharma", topic: "Machine Operation", status: "In Progress", date: "" },
+];
+
+let seedWaste = [
+  { date: TODAY, type: "General", qty: 32, area: "Office Area", collectedBy: "Geeta Devi" },
+  { date: TODAY, type: "Food", qty: 18, area: "Cafeteria", collectedBy: "Anita Sharma" },
+  { date: YDAY, type: "Plastic", qty: 6, area: "Ground Floor Lobby", collectedBy: "Ramesh Kumar" },
+];
+
+let seedRoles = [
+  { name: "Admin", permissions: "Full access to all modules" },
+  { name: "Supervisor", permissions: "Manpower, cleaning, complaints, reports" },
+  { name: "Viewer", permissions: "Read-only reports" },
+];
+
+let seedUsers = [
+  { username: "r.kumar", name: "Ramesh Kumar", email: "ramesh@shiftline.in", role: "Supervisor", status: "Active" },
+  { username: "p.singh", name: "Priya Singh", email: "priya@shiftline.in", role: "Admin", status: "Active" },
+];
+
+let seedAttendance = [
+  { date: TODAY, employee: "Ramesh Kumar", status: "Present", checkIn: "06:28", checkOut: "" },
+  { date: TODAY, employee: "Suresh Patil", status: "Present", checkIn: "06:35", checkOut: "" },
+  { date: TODAY, employee: "Anita Sharma", status: "Present", checkIn: "13:25", checkOut: "" },
+  { date: TODAY, employee: "Geeta Devi", status: "Present", checkIn: "08:50", checkOut: "" },
+  { date: TODAY, employee: "Manoj Yadav", status: "Leave", checkIn: "", checkOut: "" },
+  { date: TODAY, employee: "Priya Singh", status: "Present", checkIn: "08:32", checkOut: "" },
+];
+
+/* ---------------------------------------------------------------- */
+/* NAV + SCHEMAS                                                     */
+/* ---------------------------------------------------------------- */
+
+const NAV = [
+  { key: "dashboard", label: "Dashboard", icon: Home, type: "custom" },
+  { group: "Manpower", icon: HardHat, items: [
+    { key: "staff", label: "Staff Master", type: "custom" },
+    { key: "attendance", label: "Attendance", type: "custom" },
+    { key: "shifts", label: "Shift Planning", type: "generic" },
+  ]},
+  { group: "Areas", icon: MapPin, items: [
+    { key: "areas", label: "Area Master", type: "generic" },
+  ]},
+  { group: "Cleaning", icon: Sparkles, items: [
+    { key: "tasks", label: "Task Master", type: "generic" },
+    { key: "allocations", label: "Daily Allocation", type: "generic" },
+    { key: "checklist", label: "Daily Checklist", type: "generic" },
+    { key: "deepCleaning", label: "Deep Cleaning", type: "generic" },
+  ]},
+  { group: "Complaints", icon: AlertTriangle, items: [
+    { key: "complaints", label: "Complaint Register", type: "custom" },
+  ]},
+  { group: "Inventory", icon: Package, items: [
+    { key: "consumables", label: "Consumables", type: "generic" },
+    { key: "chemicals", label: "Chemicals", type: "generic" },
+    { key: "stockIn", label: "Stock In", type: "generic" },
+    { key: "stockOut", label: "Stock Out", type: "generic" },
+    { key: "purchase", label: "Purchase", type: "generic" },
+  ]},
+  { group: "Equipment", icon: Wrench, items: [
+    { key: "equipment", label: "Equipment Register", type: "generic" },
+    { key: "maintenance", label: "Maintenance", type: "generic" },
+  ]},
+  { group: "Training", icon: GraduationCap, items: [
+    { key: "training", label: "Training Register", type: "generic" },
+  ]},
+  { group: "Waste", icon: Trash2, items: [
+    { key: "waste", label: "Waste Register", type: "generic" },
+  ]},
+  { group: "Reports", icon: BarChart3, items: [
+    { key: "report-daily", label: "Daily", type: "report" },
+    { key: "report-weekly", label: "Weekly", type: "report" },
+    { key: "report-monthly", label: "Monthly", type: "report" },
+  ]},
+  { group: "Settings", icon: Settings, items: [
+    { key: "users", label: "Users", type: "custom" },
+    { key: "roles", label: "Roles", type: "generic" },
+    { key: "company", label: "Company", type: "company" },
+    { key: "backup", label: "Backup", type: "backup" },
+  ]},
+];
+
+const SCHEMAS = {
+  shifts: { title: "Shift Planning", fields: [
+    { key: "name", label: "Shift Name", type: "text" },
+    { key: "start", label: "Start Time", type: "text" },
+    { key: "end", label: "End Time", type: "text" },
+    { key: "employees", label: "Employees Assigned", type: "number" },
+    { key: "coverage", label: "Area Coverage", type: "text" },
+  ]},
+  areas: { title: "Area Master", idPrefix: "AR", fields: [
+    { key: "id", label: "Area ID", type: "auto" },
+    { key: "building", label: "Building", type: "text" },
+    { key: "floor", label: "Floor", type: "text" },
+    { key: "name", label: "Area Name", type: "text" },
+    { key: "type", label: "Area Type", type: "select", options: ["Restroom", "Lobby", "Office", "Cafeteria", "Corridor", "Parking", "Warehouse"] },
+    { key: "size", label: "Size (sqft)", type: "number" },
+    { key: "frequency", label: "Frequency", type: "select", options: ["Hourly", "Daily", "Weekly", "Monthly"] },
+    { key: "responsible", label: "Responsible Staff", type: "select", optionsFrom: { module: "staff", field: "name" } },
+  ]},
+  tasks: { title: "Task Master", idPrefix: "TSK", fields: [
+    { key: "id", label: "Task ID", type: "auto" },
+    { key: "name", label: "Task Name", type: "text" },
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "frequency", label: "Frequency", type: "select", options: ["Hourly", "Daily", "Weekly", "Monthly"] },
+    { key: "method", label: "Cleaning Method", type: "text" },
+    { key: "chemical", label: "Chemical", type: "select", optionsFrom: { module: "chemicals", field: "name" } },
+    { key: "equipment", label: "Equipment", type: "select", optionsFrom: { module: "equipment", field: "name" } },
+    { key: "standardTime", label: "Standard Time (min)", type: "number" },
+  ]},
+  allocations: { title: "Daily Allocation", fields: [
+    { key: "date", label: "Date", type: "date" },
+    { key: "shift", label: "Shift", type: "select", optionsFrom: { module: "shifts", field: "name" } },
+    { key: "employee", label: "Employee", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "task", label: "Task", type: "select", optionsFrom: { module: "tasks", field: "name" } },
+    { key: "status", label: "Status", type: "select", options: ["Pending", "In Progress", "Completed"] },
+    { key: "remarks", label: "Remarks", type: "text" },
+  ]},
+  checklist: { title: "Daily Checklist", fields: [
+    { key: "date", label: "Date", type: "date" },
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "task", label: "Task", type: "select", optionsFrom: { module: "tasks", field: "name" } },
+    { key: "checkedBy", label: "Checked By", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "status", label: "Status", type: "select", options: ["OK", "Not OK", "Pending"] },
+    { key: "remarks", label: "Remarks", type: "text" },
+  ]},
+  deepCleaning: { title: "Deep Cleaning", fields: [
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "schedule", label: "Schedule", type: "select", options: ["Daily", "Weekly", "Monthly", "Quarterly", "Half-yearly", "Annual"] },
+    { key: "plannedDate", label: "Planned Date", type: "date" },
+    { key: "stage", label: "Stage", type: "select", options: ["Planned", "Assigned", "Started", "Completed", "Verified"] },
+    { key: "assignedTo", label: "Assigned To", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "remarks", label: "Remarks", type: "text" },
+  ]},
+  consumables: { title: "Consumables", fields: [
+    { key: "item", label: "Item", type: "text" },
+    { key: "category", label: "Category", type: "select", options: ["Paper", "Chemical", "PPE", "Tools", "Other"] },
+    { key: "opening", label: "Opening Stock", type: "number" },
+    { key: "received", label: "Received", type: "number" },
+    { key: "issued", label: "Issued", type: "number" },
+    { key: "closing", label: "Closing Stock", type: "number" },
+    { key: "min", label: "Min Stock", type: "number" },
+    { key: "reorder", label: "Reorder Level", type: "number" },
+  ]},
+  chemicals: { title: "Chemical Register", fields: [
+    { key: "name", label: "Chemical Name", type: "text" },
+    { key: "brand", label: "Brand", type: "text" },
+    { key: "application", label: "Application", type: "text" },
+    { key: "dilution", label: "Dilution", type: "text" },
+    { key: "ph", label: "pH", type: "text" },
+    { key: "storage", label: "Storage Location", type: "text" },
+    { key: "stock", label: "Stock", type: "number" },
+    { key: "minLevel", label: "Min Level", type: "number" },
+    { key: "expiry", label: "Expiry Date", type: "date" },
+  ]},
+  stockIn: { title: "Stock In", fields: [
+    { key: "date", label: "Date", type: "date" },
+    { key: "supplier", label: "Supplier", type: "text" },
+    { key: "invoice", label: "Invoice No.", type: "text" },
+    { key: "item", label: "Item", type: "text" },
+    { key: "qty", label: "Quantity", type: "number" },
+    { key: "unit", label: "Unit", type: "select", options: ["Ltr", "Kg", "Pcs", "Box"] },
+    { key: "batch", label: "Batch", type: "text" },
+    { key: "expiry", label: "Expiry", type: "date" },
+    { key: "receivedBy", label: "Received By", type: "select", optionsFrom: { module: "staff", field: "name" } },
+  ]},
+  stockOut: { title: "Stock Out", fields: [
+    { key: "date", label: "Date", type: "date" },
+    { key: "item", label: "Item", type: "text" },
+    { key: "qty", label: "Quantity", type: "number" },
+    { key: "issuedTo", label: "Issued To", type: "text" },
+    { key: "department", label: "Department", type: "text" },
+    { key: "purpose", label: "Purpose", type: "text" },
+    { key: "issuedBy", label: "Issued By", type: "select", optionsFrom: { module: "staff", field: "name" } },
+  ]},
+  purchase: { title: "Purchase", fields: [
+    { key: "item", label: "Item", type: "text" },
+    { key: "qty", label: "Requested Qty", type: "number" },
+    { key: "status", label: "Status", type: "select", options: ["Requested", "Approved", "PO Raised", "Received"] },
+    { key: "supplier", label: "Supplier", type: "text" },
+    { key: "cost", label: "Cost (\u20b9)", type: "number" },
+    { key: "requestedBy", label: "Requested By", type: "select", optionsFrom: { module: "staff", field: "name" } },
+  ]},
+  equipment: { title: "Equipment Register", idPrefix: "EQ", fields: [
+    { key: "id", label: "Equipment ID", type: "auto" },
+    { key: "name", label: "Equipment Name", type: "text" },
+    { key: "brand", label: "Brand", type: "text" },
+    { key: "model", label: "Model", type: "text" },
+    { key: "serial", label: "Serial Number", type: "text" },
+    { key: "location", label: "Location", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "assignedTo", label: "Assigned Employee", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "condition", label: "Condition", type: "select", options: ["Good", "Fair", "Needs Repair"] },
+    { key: "warranty", label: "Warranty Until", type: "date" },
+  ]},
+  maintenance: { title: "Maintenance", fields: [
+    { key: "equipment", label: "Equipment", type: "select", optionsFrom: { module: "equipment", field: "name" } },
+    { key: "issue", label: "Issue", type: "text" },
+    { key: "serviceDate", label: "Service Date", type: "date" },
+    { key: "technician", label: "Technician", type: "text" },
+    { key: "cost", label: "Cost (\u20b9)", type: "number" },
+    { key: "nextService", label: "Next Service", type: "date" },
+    { key: "status", label: "Status", type: "select", options: ["Open", "In Progress", "Completed"] },
+  ]},
+  training: { title: "Training Register", fields: [
+    { key: "employee", label: "Employee", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "topic", label: "Training Topic", type: "select", options: ["Chemical Safety", "PPE", "Restroom Cleaning", "Machine Operation", "Waste Management", "Fire Safety"] },
+    { key: "status", label: "Status", type: "select", options: ["Completed", "In Progress", "Pending"] },
+    { key: "date", label: "Date", type: "date" },
+  ]},
+  waste: { title: "Waste Register", fields: [
+    { key: "date", label: "Date", type: "date" },
+    { key: "type", label: "Waste Type", type: "select", options: ["General", "Plastic", "Paper", "Food", "E-waste", "Other"] },
+    { key: "qty", label: "Quantity (kg)", type: "number" },
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "collectedBy", label: "Collected By", type: "select", optionsFrom: { module: "staff", field: "name" } },
+  ]},
+  users: { title: "Users", fields: [
+    { key: "username", label: "Username", type: "text" },
+    { key: "name", label: "Full Name", type: "text" },
+    { key: "role", label: "Role", type: "select", optionsFrom: { module: "roles", field: "name" } },
+    { key: "status", label: "Status", type: "select", options: ["Active", "Inactive"] },
+  ]},
+  roles: { title: "Roles", fields: [
+    { key: "name", label: "Role Name", type: "text" },
+    { key: "permissions", label: "Permissions", type: "text" },
+  ]},
+};
+
+const STATUS_COLORS = {
+  Active: "green", Present: "green", Completed: "green", Good: "green", OK: "green", Closed: "green", Verified: "green", Received: "green",
+  "On Leave": "amber", Leave: "amber", Pending: "amber", Fair: "amber", "In Progress": "amber", Assigned: "amber", New: "amber", Requested: "amber", Started: "amber", Planned: "steel",
+  "Needs Repair": "red", "Not OK": "red", Inactive: "steel", Open: "amber", Absent: "red", High: "red", Medium: "amber", Low: "steel",
+};
+
+/* ---------------------------------------------------------------- */
+/* SMALL UI PRIMITIVES                                               */
+/* ---------------------------------------------------------------- */
+
+function Badge({ value }) {
+  const tone = STATUS_COLORS[value] || "steel";
+  return <span className={`badge badge-${tone}`}>{value}</span>;
+}
+
+function KpiCard({ label, value, sub, tone }) {
+  return (
+    <div className={`kpi kpi-${tone || "default"}`}>
+      <div className="kpi-value">{value}</div>
+      <div className="kpi-label">{label}</div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+    </div>
+  );
+}
+
+function Field({ field, value, onChange, data }) {
+  const opts = field.options || (field.optionsFrom ? (data[field.optionsFrom.module] || []).map(r => r[field.optionsFrom.field]).filter(Boolean) : null);
+  if (field.type === "select") {
+    return (
+      <select className="input" value={value || ""} onChange={e => onChange(e.target.value)}>
+        <option value="">Select {field.label.toLowerCase()}</option>
+        {[...new Set(opts)].map(o => <option key={o} value={o}>{o}</option>)}
+      </select>
+    );
+  }
+  if (field.type === "date") {
+    return <input className="input" type="date" value={value || ""} onChange={e => onChange(e.target.value)} />;
+  }
+  if (field.type === "number") {
+    return <input className="input" type="number" value={value ?? ""} onChange={e => onChange(e.target.value === "" ? "" : Number(e.target.value))} />;
+  }
+  return <input className="input" type="text" value={value || ""} onChange={e => onChange(e.target.value)} />;
+}
+
+/* ---------------------------------------------------------------- */
+/* GENERIC TABLE MODULE                                              */
+/* ---------------------------------------------------------------- */
+
+function GenericModule({ moduleKey, schema, data, setData, readOnly }) {
+  const rows = data[moduleKey] || [];
+  const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState(null); // {index, draft} or null
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({});
+
+  const visibleFields = schema.fields.filter(f => f.type !== "auto");
+
+  const filtered = useMemo(() => {
+    if (!query.trim()) return rows;
+    const q = query.toLowerCase();
+    return rows.filter(r => Object.values(r).some(v => String(v).toLowerCase().includes(q)));
+  }, [rows, query]);
+
+  function startAdd() {
+    const blank = {};
+    visibleFields.forEach(f => (blank[f.key] = ""));
+    setDraft(blank);
+    setAdding(true);
+    setEditing(null);
+  }
+
+  function startEdit(idx) {
+    setDraft({ ...rows[idx] });
+    setEditing(idx);
+    setAdding(false);
+  }
+
+  function save() {
+    const next = [...rows];
+    if (adding) {
+      const row = { ...draft };
+      const idField = schema.fields.find(f => f.type === "auto");
+      if (idField) {
+        const n = rows.length + 1;
+        row[idField.key] = `${schema.idPrefix}${String(n).padStart(3, "0")}`;
+      }
+      next.push(row);
+    } else if (editing !== null) {
+      next[editing] = { ...draft };
+    }
+    setData({ ...data, [moduleKey]: next });
+    setAdding(false);
+    setEditing(null);
+  }
+
+  function remove(idx) {
+    const next = rows.filter((_, i) => i !== idx);
+    setData({ ...data, [moduleKey]: next });
+  }
+
+  const formOpen = adding || editing !== null;
+
+  return (
+    <div className="module">
+      <div className="module-toolbar">
+        <div className="search-box">
+          <Search size={15} />
+          <input placeholder={`Search ${schema.title.toLowerCase()}...`} value={query} onChange={e => setQuery(e.target.value)} />
+        </div>
+        {!readOnly && <button className="btn btn-primary" onClick={startAdd}><Plus size={16} /> Add {schema.title}</button>}
+      </div>
+
+      {!readOnly && formOpen && (
+        <div className="form-card">
+          <div className="form-card-head">
+            <span>{adding ? `New ${schema.title}` : `Edit ${schema.title}`}</span>
+            <button className="icon-btn" onClick={() => { setAdding(false); setEditing(null); }}><X size={16} /></button>
+          </div>
+          <div className="form-grid">
+            {visibleFields.map(f => (
+              <label key={f.key} className="form-field">
+                <span>{f.label}</span>
+                <Field field={f} value={draft[f.key]} onChange={v => setDraft({ ...draft, [f.key]: v })} data={data} />
+              </label>
+            ))}
+          </div>
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={save}><Save size={15} /> Save</button>
+            <button className="btn btn-ghost" onClick={() => { setAdding(false); setEditing(null); }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {schema.fields.map(f => <th key={f.key}>{f.label}</th>)}
+              {!readOnly && <th className="actions-col">Actions</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((row, idx) => {
+              const realIdx = rows.indexOf(row);
+              return (
+                <tr key={realIdx}>
+                  {schema.fields.map(f => (
+                    <td key={f.key}>
+                      {["status", "condition", "stage", "priority"].includes(f.key) || f.key === "status" ? <Badge value={row[f.key]} /> : String(row[f.key] ?? "")}
+                    </td>
+                  ))}
+                  {!readOnly && (
+                    <td className="actions-col">
+                      <button className="icon-btn" onClick={() => startEdit(realIdx)}><Pencil size={14} /></button>
+                      <button className="icon-btn icon-btn-danger" onClick={() => remove(realIdx)}><Trash size={14} /></button>
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && (
+              <tr><td colSpan={schema.fields.length + 1} className="empty-row">No records yet. Use "Add {schema.title}" to create the first one.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* STAFF MODULE (custom)                                             */
+/* ---------------------------------------------------------------- */
+
+function initials(name) {
+  return name.split(" ").map(p => p[0]).join("").slice(0, 2).toUpperCase();
+}
+
+function Avatar({ name, photo, size }) {
+  const s = size || 36;
+  if (photo) return <img src={photo} alt={name} className="avatar" style={{ width: s, height: s, objectFit: "cover" }} />;
+  return <div className="avatar" style={{ width: s, height: s, fontSize: s * 0.36 }}>{initials(name)}</div>;
+}
+
+function handlePhotoFile(file, onDone) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => onDone(reader.result);
+  reader.readAsDataURL(file);
+}
+
+function StaffModule({ data, setData, readOnly }) {
+  const rows = data.staff;
+  const [query, setQuery] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState({});
+
+  const fields = [
+    { key: "name", label: "Employee Name", type: "text" },
+    { key: "designation", label: "Designation", type: "text" },
+    { key: "department", label: "Department", type: "text" },
+    { key: "joiningDate", label: "Joining Date", type: "date" },
+    { key: "contact", label: "Contact Number", type: "text" },
+    { key: "shift", label: "Shift", type: "select", optionsFrom: { module: "shifts", field: "name" } },
+    { key: "area", label: "Assigned Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "status", label: "Employment Status", type: "select", options: ["Active", "On Leave", "Inactive"] },
+  ];
+
+  const filtered = rows.filter(r => !query.trim() || Object.values(r).some(v => String(v).toLowerCase().includes(query.toLowerCase())));
+
+  function startAdd() {
+    const blank = {}; fields.forEach(f => (blank[f.key] = "")); setDraft(blank); setAdding(true); setEditing(null);
+  }
+  function startEdit(idx) { setDraft({ ...rows[idx] }); setEditing(idx); setAdding(false); }
+  function save() {
+    const next = [...rows];
+    if (adding) {
+      const n = rows.length + 1;
+      next.push({ id: `EMP${String(n).padStart(3, "0")}`, ...draft });
+    } else if (editing !== null) next[editing] = { ...rows[editing], ...draft };
+    setData({ ...data, staff: next }); setAdding(false); setEditing(null);
+  }
+  function remove(idx) { setData({ ...data, staff: rows.filter((_, i) => i !== idx) }); }
+
+  return (
+    <div className="module">
+      <div className="module-toolbar">
+        <div className="search-box"><Search size={15} /><input placeholder="Search staff..." value={query} onChange={e => setQuery(e.target.value)} /></div>
+        {!readOnly && <button className="btn btn-primary" onClick={startAdd}><Plus size={16} /> Add Employee</button>}
+      </div>
+
+      {!readOnly && (adding || editing !== null) && (
+        <div className="form-card">
+          <div className="form-card-head">
+            <span>{adding ? "New Employee" : "Edit Employee"}</span>
+            <button className="icon-btn" onClick={() => { setAdding(false); setEditing(null); }}><X size={16} /></button>
+          </div>
+          <div className="form-grid">
+            <div className="form-field">
+              <span>Photo</span>
+              <div className="photo-upload">
+                <Avatar name={draft.name || "?"} photo={draft.photo} size={52} />
+                <div className="photo-upload-actions">
+                  <label className="btn btn-ghost btn-small photo-input-label">
+                    Upload
+                    <input type="file" accept="image/*" style={{ display: "none" }} onChange={e => handlePhotoFile(e.target.files[0], photo => setDraft({ ...draft, photo }))} />
+                  </label>
+                  {draft.photo && <button type="button" className="icon-btn icon-btn-danger" onClick={() => setDraft({ ...draft, photo: null })}>Remove</button>}
+                </div>
+              </div>
+            </div>
+            {fields.map(f => (
+              <label key={f.key} className="form-field">
+                <span>{f.label}</span>
+                <Field field={f} value={draft[f.key]} onChange={v => setDraft({ ...draft, [f.key]: v })} data={data} />
+              </label>
+            ))}
+          </div>
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={save}><Save size={15} /> Save</button>
+            <button className="btn btn-ghost" onClick={() => { setAdding(false); setEditing(null); }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="staff-grid">
+        {filtered.map((s) => {
+          const realIdx = rows.indexOf(s);
+          return (
+            <div className="staff-card" key={s.id}>
+              <div className="staff-card-top">
+                <Avatar name={s.name} photo={s.photo} size={36} />
+                <div>
+                  <div className="staff-name">{s.name}</div>
+                  <div className="staff-role">{s.designation}</div>
+                </div>
+                <Badge value={s.status} />
+              </div>
+              <div className="staff-meta">
+                <span>{s.id}</span><span>&middot;</span><span>{s.department}</span>
+              </div>
+              <div className="staff-meta">
+                <span>{s.shift}</span><span>&middot;</span><span>{s.area}</span>
+              </div>
+              <div className="staff-meta muted">{s.contact} &middot; joined {s.joiningDate}</div>
+              {!readOnly && (
+                <div className="staff-actions">
+                  <button className="icon-btn" onClick={() => startEdit(realIdx)}><Pencil size={14} /> Edit</button>
+                  <button className="icon-btn icon-btn-danger" onClick={() => remove(realIdx)}><Trash size={14} /> Remove</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {filtered.length === 0 && <div className="empty-row" style={{ padding: "24px 4px" }}>No employees match your search.</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* ATTENDANCE MODULE (custom)                                        */
+/* ---------------------------------------------------------------- */
+
+const ATT_STATUSES = ["Present", "Absent", "Leave", "Weekly Off", "Half Day", "OD", "Holiday"];
+
+function AttendanceModule({ data, setData, readOnly }) {
+  const [date, setDate] = useState(TODAY);
+  const records = data.attendance;
+
+  function recordFor(empName) {
+    return records.find(r => r.date === date && r.employee === empName);
+  }
+
+  function update(empName, patch) {
+    const idx = records.findIndex(r => r.date === date && r.employee === empName);
+    let next = [...records];
+    if (idx === -1) next.push({ date, employee: empName, status: "Present", checkIn: "", checkOut: "", ...patch });
+    else next[idx] = { ...next[idx], ...patch };
+    setData({ ...data, attendance: next });
+  }
+
+  const todaysRecords = data.staff.map(s => recordFor(s.name)).filter(Boolean);
+  const presentCount = todaysRecords.filter(r => r.status === "Present" || r.status === "Half Day" || r.status === "OD").length;
+  const pct = data.staff.length ? Math.round((presentCount / data.staff.length) * 100) : 0;
+
+  return (
+    <div className="module">
+      <div className="module-toolbar">
+        <label className="form-field" style={{ maxWidth: 220 }}>
+          <span>Date</span>
+          <input className="input" type="date" value={date} onChange={e => setDate(e.target.value)} />
+        </label>
+        <div className="att-summary">
+          <span className="att-pct">{pct}%</span> attendance &middot; {presentCount}/{data.staff.length} present
+        </div>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Employee</th><th>Shift</th><th>Status</th><th>Check-in</th><th>Check-out</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.staff.map(s => {
+              const rec = recordFor(s.name) || { status: "Present", checkIn: "", checkOut: "" };
+              return (
+                <tr key={s.id}>
+                  <td>{s.name}</td>
+                  <td>{s.shift}</td>
+                  <td>
+                    <select className="input input-compact" value={rec.status} disabled={readOnly} onChange={e => update(s.name, { status: e.target.value })}>
+                      {ATT_STATUSES.map(st => <option key={st} value={st}>{st}</option>)}
+                    </select>
+                  </td>
+                  <td><input className="input input-compact" type="time" value={rec.checkIn} disabled={readOnly} onChange={e => update(s.name, { checkIn: e.target.value })} /></td>
+                  <td><input className="input input-compact" type="time" value={rec.checkOut} disabled={readOnly} onChange={e => update(s.name, { checkOut: e.target.value })} /></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* COMPLAINTS MODULE (custom)                                        */
+/* ---------------------------------------------------------------- */
+
+const COMPLAINT_FLOW = ["New", "Assigned", "In Progress", "Completed", "Verified", "Closed"];
+
+function ComplaintsModule({ data, setData, readOnly }) {
+  const rows = data.complaints;
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({});
+
+  const fields = [
+    { key: "area", label: "Area", type: "select", optionsFrom: { module: "areas", field: "name" } },
+    { key: "type", label: "Complaint Type", type: "select", options: ["Cleanliness", "Restroom", "Pest", "Odor", "Damage", "Other"] },
+    { key: "priority", label: "Priority", type: "select", options: ["Low", "Medium", "High"] },
+    { key: "assignedEmployee", label: "Assigned Employee", type: "select", optionsFrom: { module: "staff", field: "name" } },
+    { key: "raisedDate", label: "Raised Date", type: "date" },
+    { key: "remarks", label: "Remarks", type: "text" },
+  ];
+
+  function startAdd() {
+    const blank = {}; fields.forEach(f => (blank[f.key] = "")); blank.raisedDate = TODAY; setDraft(blank); setAdding(true);
+  }
+  function save() {
+    const n = rows.length + 1;
+    const next = [...rows, { id: `CMP${String(n).padStart(3, "0")}`, status: "New", ...draft }];
+    setData({ ...data, complaints: next }); setAdding(false);
+  }
+  function advance(idx) {
+    const next = [...rows];
+    const cur = COMPLAINT_FLOW.indexOf(next[idx].status);
+    if (cur < COMPLAINT_FLOW.length - 1) next[idx] = { ...next[idx], status: COMPLAINT_FLOW[cur + 1] };
+    setData({ ...data, complaints: next });
+  }
+
+  const open = rows.filter(r => r.status !== "Closed" && r.status !== "Verified").length;
+
+  return (
+    <div className="module">
+      <div className="module-toolbar">
+        <div className="att-summary"><span className="att-pct">{open}</span> open of {rows.length} total complaints</div>
+        {!readOnly && <button className="btn btn-primary" onClick={startAdd}><Plus size={16} /> New Complaint</button>}
+      </div>
+
+      {!readOnly && adding && (
+        <div className="form-card">
+          <div className="form-card-head">
+            <span>New Complaint</span>
+            <button className="icon-btn" onClick={() => setAdding(false)}><X size={16} /></button>
+          </div>
+          <div className="form-grid">
+            {fields.map(f => (
+              <label key={f.key} className="form-field">
+                <span>{f.label}</span>
+                <Field field={f} value={draft[f.key]} onChange={v => setDraft({ ...draft, [f.key]: v })} data={data} />
+              </label>
+            ))}
+          </div>
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={save}><Save size={15} /> Save</button>
+            <button className="btn btn-ghost" onClick={() => setAdding(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="complaint-list">
+        {rows.map((c) => {
+          const realIdx = rows.indexOf(c);
+          const nextStage = COMPLAINT_FLOW[COMPLAINT_FLOW.indexOf(c.status) + 1];
+          return (
+            <div className="complaint-card" key={c.id}>
+              <div className="complaint-top">
+                <div>
+                  <div className="complaint-id">{c.id} &middot; {c.area}</div>
+                  <div className="staff-meta muted">{c.type} &middot; raised {c.raisedDate}</div>
+                </div>
+                <Badge value={c.priority} />
+              </div>
+              <div className="complaint-flow">
+                {COMPLAINT_FLOW.map((stage, i) => (
+                  <React.Fragment key={stage}>
+                    <span className={`flow-step ${COMPLAINT_FLOW.indexOf(c.status) >= i ? "flow-done" : ""}`}>{stage}</span>
+                    {i < COMPLAINT_FLOW.length - 1 && <ArrowRight size={12} className="flow-arrow" />}
+                  </React.Fragment>
+                ))}
+              </div>
+              <div className="complaint-bottom">
+                <span className="staff-meta">Assigned: {c.assignedEmployee || "Unassigned"}</span>
+                {nextStage && !readOnly ? (
+                  <button className="btn btn-ghost btn-small" onClick={() => advance(realIdx)}>Mark {nextStage} <ArrowRight size={13} /></button>
+                ) : <Badge value={c.status} />}
+              </div>
+            </div>
+          );
+        })}
+        {rows.length === 0 && <div className="empty-row" style={{ padding: "24px 4px" }}>No complaints logged. Use "New Complaint" to register one.</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* DASHBOARD                                                         */
+/* ---------------------------------------------------------------- */
+
+function Dashboard({ data, go }) {
+  const totalStaff = data.staff.length;
+  const presentToday = data.attendance.filter(r => r.date === TODAY && (r.status === "Present" || r.status === "Half Day" || r.status === "OD")).length;
+  const attPct = totalStaff ? Math.round((presentToday / totalStaff) * 100) : 0;
+  const openComplaints = data.complaints.filter(c => c.status !== "Closed" && c.status !== "Verified");
+  const todaysAllocations = data.allocations.filter(a => a.date === TODAY);
+  const doneAllocations = todaysAllocations.filter(a => a.status === "Completed").length;
+  const lowStockConsumables = data.consumables.filter(c => Number(c.closing) <= Number(c.reorder));
+  const lowStockChemicals = data.chemicals.filter(c => Number(c.stock) <= Number(c.minLevel));
+  const dueMaintenance = data.maintenance.filter(m => m.status !== "Completed");
+
+  return (
+    <div className="module">
+      <div className="kpi-grid">
+        <KpiCard label="Total Staff" value={totalStaff} sub={`${data.staff.filter(s => s.status === "Active").length} active`} />
+        <KpiCard label="Attendance Today" value={`${attPct}%`} sub={`${presentToday}/${totalStaff} present`} tone={attPct < 80 ? "amber" : "green"} />
+        <KpiCard label="Open Complaints" value={openComplaints.length} sub={`of ${data.complaints.length} total`} tone={openComplaints.length ? "amber" : "green"} />
+        <KpiCard label="Tasks Today" value={`${doneAllocations}/${todaysAllocations.length}`} sub="allocations completed" />
+        <KpiCard label="Low Stock Items" value={lowStockConsumables.length + lowStockChemicals.length} sub="need reorder" tone={lowStockConsumables.length + lowStockChemicals.length ? "red" : "green"} />
+        <KpiCard label="Equipment in Service" value={dueMaintenance.length} sub="open maintenance jobs" />
+      </div>
+
+      <div className="dash-columns">
+        <div className="dash-panel">
+          <div className="dash-panel-head"><AlertTriangle size={16} /> Open Complaints</div>
+          {openComplaints.slice(0, 5).map(c => (
+            <div className="dash-row" key={c.id}>
+              <div>
+                <div className="dash-row-title">{c.area}</div>
+                <div className="staff-meta muted">{c.type} &middot; {c.id}</div>
+              </div>
+              <Badge value={c.status} />
+            </div>
+          ))}
+          {openComplaints.length === 0 && <div className="empty-row">No open complaints right now.</div>}
+          <button className="btn btn-ghost btn-small" onClick={() => go("complaints")}>View complaint register</button>
+        </div>
+
+        <div className="dash-panel">
+          <div className="dash-panel-head"><Package size={16} /> Low Stock Alerts</div>
+          {[...lowStockConsumables.map(c => ({ name: c.item, level: c.closing })), ...lowStockChemicals.map(c => ({ name: c.name, level: c.stock }))].slice(0, 5).map((it, i) => (
+            <div className="dash-row" key={i}>
+              <div className="dash-row-title">{it.name}</div>
+              <Badge value="Low" />
+            </div>
+          ))}
+          {lowStockConsumables.length + lowStockChemicals.length === 0 && <div className="empty-row">Stock levels look healthy.</div>}
+          <button className="btn btn-ghost btn-small" onClick={() => go("consumables")}>View inventory</button>
+        </div>
+
+        <div className="dash-panel">
+          <div className="dash-panel-head"><CheckCircle2 size={16} /> Today's Allocations</div>
+          {todaysAllocations.slice(0, 5).map((a, i) => (
+            <div className="dash-row" key={i}>
+              <div>
+                <div className="dash-row-title">{a.employee}</div>
+                <div className="staff-meta muted">{a.area}</div>
+              </div>
+              <Badge value={a.status} />
+            </div>
+          ))}
+          {todaysAllocations.length === 0 && <div className="empty-row">No allocations for today yet.</div>}
+          <button className="btn btn-ghost btn-small" onClick={() => go("allocations")}>View daily allocation</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* REPORTS                                                           */
+/* ---------------------------------------------------------------- */
+
+function exportExcel(period, data, kpis) {
+  const wb = XLSX.utils.book_new();
+  const summary = kpis.map(k => ({ Metric: k.label, Value: k.value, Detail: k.sub || "" }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), "Summary");
+
+  function addSheet(name, rows) {
+    if (rows && rows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), name.slice(0, 31));
+  }
+
+  if (period === "daily") {
+    addSheet("Attendance", data.attendance.filter(r => r.date === TODAY));
+    addSheet("Allocations", data.allocations.filter(a => a.date === TODAY));
+    addSheet("Complaints", data.complaints.filter(c => c.raisedDate === TODAY));
+    addSheet("Waste", data.waste.filter(w => w.date === TODAY));
+  } else if (period === "weekly") {
+    addSheet("Attendance", data.attendance);
+    addSheet("Allocations", data.allocations);
+    addSheet("Complaints", data.complaints);
+    addSheet("Consumables", data.consumables);
+  } else {
+    addSheet("Staff", data.staff);
+    addSheet("Complaints", data.complaints);
+    addSheet("Maintenance", data.maintenance);
+    addSheet("Purchase", data.purchase);
+    addSheet("Waste", data.waste);
+  }
+
+  XLSX.writeFile(wb, `Shiftline-${period}-report-${TODAY}.xlsx`);
+}
+
+function ReportModule({ period, data }) {
+  const attToday = data.attendance.filter(r => r.date === TODAY);
+  const present = attToday.filter(r => r.status === "Present").length;
+  const absent = attToday.filter(r => r.status === "Absent").length;
+  const tasksToday = data.allocations.filter(a => a.date === TODAY);
+  const tasksDone = tasksToday.filter(a => a.status === "Completed").length;
+  const complaintsToday = data.complaints.filter(c => c.raisedDate === TODAY).length;
+  const wasteToday = data.waste.filter(w => w.date === TODAY).reduce((s, w) => s + Number(w.qty || 0), 0);
+
+  const totalStaff = data.staff.length;
+  const absenteeismPct = totalStaff ? Math.round(((totalStaff - present) / totalStaff) * 100) : 0;
+  const taskCompletionPct = data.allocations.length ? Math.round((data.allocations.filter(a => a.status === "Completed").length / data.allocations.length) * 100) : 0;
+  const wasteTotal = data.waste.reduce((s, w) => s + Number(w.qty || 0), 0);
+  const chemConsumption = data.stockOut.filter(s => data.chemicals.some(c => c.name === s.item)).reduce((s, r) => s + Number(r.qty || 0), 0);
+  const consumableConsumption = data.consumables.reduce((s, c) => s + Number(c.issued || 0), 0);
+  const maintenanceCost = data.maintenance.reduce((s, m) => s + Number(m.cost || 0), 0);
+  const purchaseCost = data.purchase.reduce((s, p) => s + Number(p.cost || 0), 0);
+
+  let kpis, note;
+  if (period === "daily") {
+    kpis = [
+      { label: "Present Today", value: present, sub: `${absent} absent` },
+      { label: "Tasks Completed", value: `${tasksDone}/${tasksToday.length}`, sub: "daily allocations" },
+      { label: "Complaints Raised", value: complaintsToday, sub: "today" },
+      { label: "Waste Collected", value: `${wasteToday} kg`, sub: "today" },
+    ];
+    note = `This snapshot reflects today's (${TODAY}) manpower, task and complaint activity, generated from live module data.`;
+  } else if (period === "weekly") {
+    kpis = [
+      { label: "Attendance %", value: `${100 - absenteeismPct}%`, sub: "across logged days" },
+      { label: "Task Completion", value: `${taskCompletionPct}%`, sub: "of allocated tasks" },
+      { label: "Complaints", value: data.complaints.length, sub: `${data.complaints.filter(c => c.status === "Closed").length} closed` },
+      { label: "Consumable Use", value: consumableConsumption, sub: "units issued" },
+    ];
+    note = "Weekly figures aggregate every attendance, task and inventory record currently logged in the system.";
+  } else {
+    kpis = [
+      { label: "Manpower", value: totalStaff, sub: `${data.staff.filter(s => s.status === "Active").length} active` },
+      { label: "Absenteeism", value: `${absenteeismPct}%`, sub: "of staff, today" },
+      { label: "Task Completion %", value: `${taskCompletionPct}%` },
+      { label: "Complaints", value: data.complaints.length },
+      { label: "Chemical Consumption", value: chemConsumption, sub: "units issued" },
+      { label: "Consumable Consumption", value: consumableConsumption, sub: "units issued" },
+      { label: "Equipment Maintenance", value: `\u20b9${maintenanceCost}`, sub: `${data.maintenance.length} jobs` },
+      { label: "Waste Generated", value: `${wasteTotal} kg` },
+      { label: "Total Cost", value: `\u20b9${maintenanceCost + purchaseCost}`, sub: "maintenance + purchase" },
+    ];
+    note = "Monthly rollup computed from all records entered to date across manpower, cleaning, inventory and equipment modules.";
+  }
+
+  return (
+    <div className="module">
+      <div className="module-toolbar no-print">
+        <span className="staff-meta muted">Export this report for sharing or printing</span>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="btn btn-ghost" onClick={() => exportExcel(period, data, kpis)}>Export Excel</button>
+          <button className="btn btn-primary" onClick={() => window.print()}>Export PDF</button>
+        </div>
+      </div>
+      <div className="kpi-grid">
+        {kpis.map(k => <KpiCard key={k.label} label={k.label} value={k.value} sub={k.sub} />)}
+      </div>
+      <p className="report-note">{note}</p>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* COMPANY + BACKUP                                                  */
+/* ---------------------------------------------------------------- */
+
+function CompanyModule({ company, setCompany }) {
+  return (
+    <div className="module">
+      <div className="form-card" style={{ maxWidth: 520 }}>
+        <div className="form-card-head"><span>Company Profile</span></div>
+        <div className="form-grid">
+          {[
+            { key: "name", label: "Company Name" },
+            { key: "address", label: "Address" },
+            { key: "contact", label: "Contact Number" },
+            { key: "email", label: "Email" },
+          ].map(f => (
+            <label key={f.key} className="form-field">
+              <span>{f.label}</span>
+              <input className="input" value={company[f.key]} onChange={e => setCompany({ ...company, [f.key]: e.target.value })} />
+            </label>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupModule({ saveState, onReset }) {
+  const [confirming, setConfirming] = useState(false);
+  const statusText = { idle: "Up to date", saving: "Saving...", saved: "All changes saved", error: "Save failed - check connection" }[saveState];
+  return (
+    <div className="module">
+      <div className="form-card" style={{ maxWidth: 460, marginBottom: 14 }}>
+        <div className="form-card-head"><span>Storage Status</span></div>
+        <p className="staff-meta muted" style={{ padding: "0 20px 20px" }}>
+          {SUPABASE_CONFIGURED ? (
+            <>Connected to your Supabase database. Every change - staff, attendance, tasks, complaints, inventory - is written straight to Postgres in real time.</>
+          ) : (
+            <>Running on shared demo storage. Add your Supabase Project URL and anon key in the code to switch this to a real database.</>
+          )}
+          <br /><br />
+          Status: <strong style={{ color: saveState === "error" ? "var(--red)" : "var(--primary)" }}>{statusText}</strong>
+        </p>
+      </div>
+      <div className="form-card" style={{ maxWidth: 460 }}>
+        <div className="form-card-head"><span>Reset Data</span></div>
+        <p className="staff-meta muted" style={{ padding: "0 20px 12px" }}>
+          Clear everything for everyone and restore the original sample data. This cannot be undone.
+        </p>
+        <div className="form-actions" style={{ padding: "0 20px 20px" }}>
+          {!confirming ? (
+            <button className="btn btn-ghost" onClick={() => setConfirming(true)}>Reset to sample data</button>
+          ) : (
+            <>
+              <button className="btn btn-primary" style={{ background: "var(--red)" }} onClick={() => { onReset(); setConfirming(false); }}>Yes, reset everything</button>
+              <button className="btn btn-ghost" onClick={() => setConfirming(false)}>Cancel</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* USERS MODULE (custom - creates real logins)                       */
+/* ---------------------------------------------------------------- */
+
+function UsersModule({ data, setData, readOnly, currentEmail }) {
+  const rows = data.users;
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState({});
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [createdNotice, setCreatedNotice] = useState(null);
+
+  function startAdd() {
+    setDraft({ email: "", name: "", role: "", status: "Active", password: "" });
+    setAdding(true); setEditing(null); setErr(""); setCreatedNotice(null);
+  }
+  function startEdit(idx) {
+    setDraft({ ...rows[idx] });
+    setEditing(idx); setAdding(false); setErr(""); setCreatedNotice(null);
+  }
+
+  async function save() {
+    setErr("");
+    if (adding) {
+      if (!draft.email || !draft.password || draft.password.length < 6) {
+        setErr("Email and a password of at least 6 characters are required to create a login.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await authFetch("signup", { email: draft.email, password: draft.password });
+        const next = [...rows, { username: draft.email.split("@")[0], name: draft.name, email: draft.email, role: draft.role, status: draft.status || "Active" }];
+        setData({ ...data, users: next });
+        setCreatedNotice(`Login created for ${draft.email}. Share the temporary password "${draft.password}" with them securely - they should change it after first sign-in. If email confirmations are on in Supabase, they'll need to confirm via email before they can log in.`);
+        setAdding(false);
+      } catch (e) {
+        setErr(e.message);
+      }
+      setBusy(false);
+    } else if (editing !== null) {
+      const next = [...rows];
+      next[editing] = { ...rows[editing], name: draft.name, role: draft.role, status: draft.status };
+      setData({ ...data, users: next });
+      setEditing(null);
+    }
+  }
+  function remove(idx) {
+    setData({ ...data, users: rows.filter((_, i) => i !== idx) });
+  }
+
+  return (
+    <div className="module">
+      {!readOnly && (
+        <div className="module-toolbar">
+          <span className="staff-meta muted">Admins can create logins for teammates here.</span>
+          <button className="btn btn-primary" onClick={startAdd}><Plus size={16} /> Add User</button>
+        </div>
+      )}
+
+      {createdNotice && <div className="form-card" style={{ padding: "14px 18px", background: "var(--greenbg)", border: "none" }}><span style={{ fontSize: 13 }}>{createdNotice}</span></div>}
+
+      {(adding || editing !== null) && (
+        <div className="form-card">
+          <div className="form-card-head">
+            <span>{adding ? "New User" : "Edit User"}</span>
+            <button className="icon-btn" onClick={() => { setAdding(false); setEditing(null); }}><X size={16} /></button>
+          </div>
+          <div className="form-grid">
+            {adding && (
+              <label className="form-field"><span>Email (used to sign in)</span>
+                <input className="input" type="email" value={draft.email} onChange={e => setDraft({ ...draft, email: e.target.value })} />
+              </label>
+            )}
+            <label className="form-field"><span>Full Name</span>
+              <input className="input" value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} />
+            </label>
+            <label className="form-field"><span>Role</span>
+              <select className="input" value={draft.role} onChange={e => setDraft({ ...draft, role: e.target.value })}>
+                <option value="">Select role</option>
+                {data.roles.map(r => <option key={r.name} value={r.name}>{r.name}</option>)}
+              </select>
+            </label>
+            <label className="form-field"><span>Status</span>
+              <select className="input" value={draft.status} onChange={e => setDraft({ ...draft, status: e.target.value })}>
+                <option>Active</option><option>Inactive</option>
+              </select>
+            </label>
+            {adding && (
+              <label className="form-field"><span>Temporary Password</span>
+                <input className="input" type="text" value={draft.password} onChange={e => setDraft({ ...draft, password: e.target.value })} />
+              </label>
+            )}
+          </div>
+          {err && <div style={{ padding: "0 20px", color: "var(--red)", fontSize: 12.5 }}>{err}</div>}
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={save} disabled={busy}><Save size={15} /> {busy ? "Saving..." : "Save"}</button>
+            <button className="btn btn-ghost" onClick={() => { setAdding(false); setEditing(null); }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th>{!readOnly && <th className="actions-col">Actions</th>}</tr></thead>
+          <tbody>
+            {rows.map((u, idx) => (
+              <tr key={u.email || idx}>
+                <td>{u.name}{u.email === currentEmail && <span className="staff-meta muted"> (you)</span>}</td>
+                <td>{u.email}</td>
+                <td><Badge value={u.role} /></td>
+                <td><Badge value={u.status} /></td>
+                {!readOnly && (
+                  <td className="actions-col">
+                    <button className="icon-btn" onClick={() => startEdit(idx)}><Pencil size={14} /></button>
+                    <button className="icon-btn icon-btn-danger" onClick={() => remove(idx)}><Trash size={14} /></button>
+                  </td>
+                )}
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={5} className="empty-row">No users yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* LOGIN / ACCESS SCREENS                                            */
+/* ---------------------------------------------------------------- */
+
+function AuthShell({ children }) {
+  return (
+    <div className="auth-shell">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600;700&display=swap');
+        .auth-shell { min-height: 100vh; width: 100%; display: flex; align-items: center; justify-content: center;
+          background: #1B211F; font-family: 'Inter', sans-serif; padding: 20px; }
+        .auth-card { background: #fff; border-radius: 12px; padding: 32px 30px; width: 100%; max-width: 380px; }
+        .auth-brand { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 26px; color: #1B211F; text-align: center; }
+        .auth-tag { text-align: center; font-size: 12.5px; color: #6E7772; margin-top: 2px; margin-bottom: 22px; }
+        .auth-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+        .auth-field label { font-size: 12.5px; color: #6E7772; }
+        .auth-field .row { display: flex; align-items: center; gap: 8px; border: 1px solid #DEE2DD; border-radius: 7px; padding: 9px 11px; }
+        .auth-field input { border: none; outline: none; font-size: 13.5px; width: 100%; font-family: 'Inter', sans-serif; }
+        .auth-btn { width: 100%; background: #2B6E5E; color: #fff; border: none; border-radius: 7px; padding: 10px; font-weight: 600; font-size: 13.5px; cursor: pointer; margin-top: 6px; }
+        .auth-btn:hover { background: #1F5449; }
+        .auth-error { background: #F8E2DE; color: #B3392C; font-size: 12.5px; padding: 9px 11px; border-radius: 7px; margin-bottom: 14px; }
+        .auth-note { text-align: center; font-size: 12px; color: #6E7772; margin-top: 16px; }
+      `}</style>
+      <div className="auth-card">{children}</div>
+    </div>
+  );
+}
+
+function LoginScreen({ bootstrap, onLogin, onBootstrap }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(""); setBusy(true);
+    try {
+      if (bootstrap) await onBootstrap(email, password, name);
+      else await onLogin(email, password);
+    } catch (e2) { setErr(e2.message); }
+    setBusy(false);
+  }
+
+  return (
+    <AuthShell>
+      <div className="auth-brand">Shiftline</div>
+      <div className="auth-tag">{bootstrap ? "Set up your Admin account" : "Sign in to Facility Operations"}</div>
+      {err && <div className="auth-error">{err}</div>}
+      <form onSubmit={submit}>
+        {bootstrap && (
+          <div className="auth-field">
+            <label>Full Name</label>
+            <div className="row"><Mail size={14} /><input value={name} onChange={e => setName(e.target.value)} required /></div>
+          </div>
+        )}
+        <div className="auth-field">
+          <label>Email</label>
+          <div className="row"><Mail size={14} /><input type="email" value={email} onChange={e => setEmail(e.target.value)} required /></div>
+        </div>
+        <div className="auth-field">
+          <label>Password</label>
+          <div className="row"><Lock size={14} /><input type="password" value={password} onChange={e => setPassword(e.target.value)} required minLength={6} /></div>
+        </div>
+        <button className="auth-btn" disabled={busy}>{busy ? "Please wait..." : bootstrap ? "Create Admin Account" : "Sign In"}</button>
+      </form>
+      {bootstrap && <div className="auth-note">No users exist yet - the first account created here becomes Admin.</div>}
+    </AuthShell>
+  );
+}
+
+function NoAccessScreen({ email, onLogout }) {
+  return (
+    <AuthShell>
+      <div className="auth-brand">Shiftline</div>
+      <div className="auth-tag">Signed in as {email}</div>
+      <div className="auth-error" style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        <ShieldCheck size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+        <span>No role has been assigned to this email yet. Ask an admin to add you under Settings &rarr; Users.</span>
+      </div>
+      <button className="auth-btn" style={{ background: "#55605B" }} onClick={onLogout}>Sign Out</button>
+    </AuthShell>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* APP SHELL                                                         */
+/* ---------------------------------------------------------------- */
+
+const TITLES = {
+  dashboard: "Dashboard", staff: "Staff Master", attendance: "Attendance",
+  "report-daily": "Daily Report", "report-weekly": "Weekly Report", "report-monthly": "Monthly Report",
+  company: "Company Profile", backup: "Backup",
+};
+
+function defaultData() {
+  return {
+    staff: seedStaff, shifts: seedShifts, areas: seedAreas, tasks: seedTasks,
+    allocations: seedAllocations, checklist: seedChecklist, deepCleaning: seedDeepCleaning,
+    complaints: seedComplaints, consumables: seedConsumables, chemicals: seedChemicals,
+    stockIn: seedStockIn, stockOut: seedStockOut, purchase: seedPurchase,
+    equipment: seedEquipment, maintenance: seedMaintenance, training: seedTraining,
+    waste: seedWaste, users: seedUsers, roles: seedRoles, attendance: seedAttendance,
+  };
+}
+function defaultCompany() {
+  return { name: "HOUSE KEEPING", address: "Plot 14, Industrial Estate, Bengaluru", contact: "080-4012 3456", email: "ops@shiftline.in" };
+}
+
+const STORAGE_DATA_KEY = "shiftline-data-v1";
+const STORAGE_COMPANY_KEY = "shiftline-company-v1";
+
+export default function App() {
+  const [data, setData] = useState(defaultData);
+  const [company, setCompany] = useState(defaultCompany);
+  const [active, setActive] = useState("dashboard");
+  const [openGroups, setOpenGroups] = useState(() => Object.fromEntries(NAV.filter(n => n.group).map(n => [n.group, true])));
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
+  const lastSyncedRef = useRef(null);
+  const companyDbIdRef = useRef(null);
+
+  const [authStatus, setAuthStatus] = useState(SUPABASE_CONFIGURED && REQUIRE_LOGIN ? "checking" : "skip");
+  const [session, setSession] = useState(null); // { accessToken, refreshToken, email }
+  const [currentRole, setCurrentRole] = useState(null);
+
+  async function completeLogin(tokenResponse) {
+    const { access_token, refresh_token, user } = tokenResponse;
+    const email = user && user.email;
+    setSession({ accessToken: access_token, refreshToken: refresh_token, email });
+    try { await window.storage.set(AUTH_STORAGE_KEY, JSON.stringify({ refresh_token }), false); } catch (e) { /* ignore */ }
+    const roleRow = await fetchRoleForEmail(email);
+    if (roleRow) { setCurrentRole(roleRow.role); setAuthStatus("ready"); }
+    else { setCurrentRole(null); setAuthStatus("noRole"); }
+  }
+
+  useEffect(() => {
+    if (!SUPABASE_CONFIGURED || !REQUIRE_LOGIN) return;
+    let cancelled = false;
+    async function initAuth() {
+      try {
+        const anyUsers = await supaFetch(`app_users?select=id&limit=1`);
+        const isEmpty = !anyUsers || anyUsers.length === 0;
+        let stored = null;
+        try { stored = await window.storage.get(AUTH_STORAGE_KEY, false); } catch (e) { /* no stored session */ }
+        if (stored && stored.value) {
+          try {
+            const { refresh_token } = JSON.parse(stored.value);
+            const refreshed = await authFetch("token?grant_type=refresh_token", { refresh_token });
+            if (!cancelled) await completeLogin(refreshed);
+            return;
+          } catch (e) { /* stored session invalid, fall through */ }
+        }
+        if (!cancelled) setAuthStatus(isEmpty ? "bootstrap" : "signedOut");
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) setAuthStatus("signedOut");
+      }
+    }
+    initAuth();
+    return () => { cancelled = true; };
+  }, []);
+
+  async function handleLogin(email, password) {
+    const res = await authFetch("token?grant_type=password", { email, password });
+    await completeLogin(res);
+  }
+
+  async function handleBootstrap(email, password, name) {
+    await authFetch("signup", { email, password });
+    let res;
+    try {
+      res = await authFetch("token?grant_type=password", { email, password });
+    } catch (e) {
+      throw new Error("Account created, but Supabase requires email confirmation before signing in. Turn off email confirmations in Authentication settings for this internal tool, or confirm via the emailed link, then sign in.");
+    }
+    const { access_token, refresh_token, user } = res;
+    setSession({ accessToken: access_token, refreshToken: refresh_token, email: user.email });
+    try { await window.storage.set(AUTH_STORAGE_KEY, JSON.stringify({ refresh_token }), false); } catch (e) { /* ignore */ }
+    await supaFetch("app_users", { method: "POST", body: JSON.stringify({ username: email.split("@")[0], name, email, role: "Admin", status: "Active" }), prefer: "return=representation" });
+    setCurrentRole("Admin");
+    setAuthStatus("ready");
+  }
+
+  async function handleLogout() {
+    try { if (session) await authFetch("logout", null, session.accessToken); } catch (e) { /* ignore */ }
+    try { await window.storage.delete(AUTH_STORAGE_KEY, false); } catch (e) { /* ignore */ }
+    setSession(null);
+    setCurrentRole(null);
+    setLoaded(false);
+    setAuthStatus("signedOut");
+  }
+
+  const authReady = !(SUPABASE_CONFIGURED && REQUIRE_LOGIN) || authStatus === "ready";
+  const effectiveRole = (SUPABASE_CONFIGURED && REQUIRE_LOGIN) ? currentRole : "Admin";
+  const readOnly = (SUPABASE_CONFIGURED && REQUIRE_LOGIN) && !canEditRole(effectiveRole);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!authReady) return;
+      if (SUPABASE_CONFIGURED) {
+        try {
+          const entries = await Promise.all(
+            Object.keys(SUPA_TABLES).map(k => loadModuleTable(k).then(rows => [k, rows]))
+          );
+          const loadedData = Object.fromEntries(entries);
+          if (cancelled) return;
+          setData(loadedData);
+          lastSyncedRef.current = loadedData;
+
+          const companyRows = await supaFetch(`company?select=*&limit=1`);
+          if (companyRows && companyRows.length) {
+            companyDbIdRef.current = companyRows[0].id;
+            if (!cancelled) setCompany({ name: companyRows[0].name, address: companyRows[0].address, contact: companyRows[0].contact, email: companyRows[0].email });
+          } else {
+            const [saved] = await supaFetch(`company`, { method: "POST", body: JSON.stringify(defaultCompany()), prefer: "return=representation" });
+            companyDbIdRef.current = saved.id;
+          }
+        } catch (e) {
+          console.error(e);
+          if (!cancelled) setSaveState("error");
+        }
+        if (!cancelled) setLoaded(true);
+        return;
+      }
+      // Fallback: shared demo storage (used until Supabase credentials are added)
+      try {
+        const d = await window.storage.get(STORAGE_DATA_KEY, true);
+        if (!cancelled && d && d.value) setData(JSON.parse(d.value));
+      } catch (e) { /* no saved data yet */ }
+      try {
+        const c = await window.storage.get(STORAGE_COMPANY_KEY, true);
+        if (!cancelled && c && c.value) setCompany(JSON.parse(c.value));
+      } catch (e) { /* no saved company yet */ }
+      if (!cancelled) setLoaded(true);
+    }
+    load();
+    return () => { cancelled = true; };
+  }, [authReady]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    setSaveState("saving");
+    const t = setTimeout(async () => {
+      try {
+        if (SUPABASE_CONFIGURED) {
+          const prev = lastSyncedRef.current || {};
+          const patched = { ...data };
+          let changed = false;
+          for (const moduleKey of Object.keys(SUPA_TABLES)) {
+            const oldRows = prev[moduleKey] || [];
+            const newRows = data[moduleKey] || [];
+            const inserted = await syncModuleTable(moduleKey, oldRows, newRows);
+            if (inserted.length) {
+              changed = true;
+              patched[moduleKey] = newRows.map(r => {
+                const match = inserted.find(i => i.tempRef === r);
+                return match ? { ...r, _dbId: match.dbId } : r;
+              });
+            }
+          }
+          lastSyncedRef.current = patched;
+          if (changed) setData(patched);
+        } else {
+          await window.storage.set(STORAGE_DATA_KEY, JSON.stringify(data), true);
+        }
+        setSaveState("saved");
+      } catch (e) { console.error(e); setSaveState("error"); }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [data, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(async () => {
+      try {
+        if (SUPABASE_CONFIGURED && companyDbIdRef.current) {
+          await supaFetch(`company?id=eq.${companyDbIdRef.current}`, { method: "PATCH", body: JSON.stringify(company) });
+        } else if (!SUPABASE_CONFIGURED) {
+          await window.storage.set(STORAGE_COMPANY_KEY, JSON.stringify(company), true);
+        }
+      } catch (e) { /* ignore */ }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [company, loaded]);
+
+  async function resetAll() {
+    const fresh = defaultData();
+    const freshCompany = defaultCompany();
+    setData(fresh);
+    setCompany(freshCompany);
+    if (!SUPABASE_CONFIGURED) {
+      try {
+        await window.storage.set(STORAGE_DATA_KEY, JSON.stringify(fresh), true);
+        await window.storage.set(STORAGE_COMPANY_KEY, JSON.stringify(freshCompany), true);
+      } catch (e) { /* ignore */ }
+    }
+    // When Supabase is configured, the debounced sync effects above pick this
+    // up automatically: every old row gets deleted and the fresh seed rows
+    // get inserted.
+  }
+
+  function findItem(key) {
+    for (const n of NAV) {
+      if (n.key === key) return n;
+      if (n.items) { const f = n.items.find(i => i.key === key); if (f) return f; }
+    }
+    return null;
+  }
+  const current = findItem(active);
+  const currentTitle = current ? current.label : TITLES[active] || "Dashboard";
+
+  const visibleNav = NAV.map(n => {
+    if (n.key) return canAccess(effectiveRole, n.key) ? n : null;
+    const items = n.items.filter(i => canAccess(effectiveRole, i.key));
+    return items.length ? { ...n, items } : null;
+  }).filter(Boolean);
+
+  function renderContent() {
+    if (!current) return null;
+    if (current.type === "custom") {
+      if (active === "dashboard") return <Dashboard data={data} go={setActive} />;
+      if (active === "staff") return <StaffModule data={data} setData={setData} readOnly={readOnly} />;
+      if (active === "attendance") return <AttendanceModule data={data} setData={setData} readOnly={readOnly} />;
+      if (active === "complaints") return <ComplaintsModule data={data} setData={setData} readOnly={readOnly} />;
+      if (active === "users") return <UsersModule data={data} setData={setData} readOnly={readOnly} currentEmail={session && session.email} />;
+    }
+    if (current.type === "generic") return <GenericModule moduleKey={active} schema={SCHEMAS[active]} data={data} setData={setData} readOnly={readOnly} />;
+    if (current.type === "report") return <ReportModule period={active.replace("report-", "")} data={data} />;
+    if (current.type === "company") return <CompanyModule company={company} setCompany={setCompany} />;
+    if (current.type === "backup") return <BackupModule saveState={saveState} onReset={resetAll} />;
+    return null;
+  }
+
+  if (SUPABASE_CONFIGURED && REQUIRE_LOGIN) {
+    if (authStatus === "checking") {
+      return (
+        <div className="loading-screen">
+          <style>{`.loading-screen { display:flex; align-items:center; justify-content:center; height:100vh; width:100%;
+            font-family: Inter, sans-serif; color:#6E7772; background:#1B211F; font-size:13.5px; }`}</style>
+          Loading...
+        </div>
+      );
+    }
+    if (authStatus === "bootstrap") return <LoginScreen bootstrap onBootstrap={handleBootstrap} />;
+    if (authStatus === "signedOut") return <LoginScreen onLogin={handleLogin} />;
+    if (authStatus === "noRole") return <NoAccessScreen email={session && session.email} onLogout={handleLogout} />;
+  }
+
+  if (!loaded) {
+    return (
+      <div className="loading-screen">
+        <style>{`
+          .loading-screen { display:flex; align-items:center; justify-content:center; height:100vh; width:100%;
+            font-family: Inter, sans-serif; color:#6E7772; background:#F3F4F1; font-size:13.5px; }
+        `}</style>
+        Loading your workspace...
+      </div>
+    );
+  }
+
+  return (
+    <div className="shell">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+        .shell {
+          --bg: #F3F4F1; --surface: #FFFFFF; --ink: #1B211F; --muted: #6E7772;
+          --line: #DEE2DD; --primary: #2B6E5E; --primary-dark: #1F5449;
+          --amber: #C9752B; --amberbg: #FBEADB; --red: #B3392C; --redbg: #F8E2DE;
+          --greenbg: #E1EEE9; --steel: #55605B; --steelbg: #E7E9E6; --sidebar: #1B211F;
+          font-family: 'Inter', sans-serif; color: var(--ink); background: var(--bg);
+          min-height: 100vh; display: flex; width: 100%;
+        }
+        .shell * { box-sizing: border-box; }
+        .brandline { font-family: 'Barlow Condensed', sans-serif; }
+
+        .sidebar {
+          width: 246px; background: var(--sidebar); color: #DCE3DF; flex-shrink: 0;
+          display: flex; flex-direction: column; height: 100vh; position: sticky; top: 0;
+          overflow-y: auto;
+        }
+        .sidebar-brand {
+          padding: 20px 18px 16px; border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .sidebar-brand .name { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 21px; color: #fff; letter-spacing: 0.3px; }
+        .sidebar-brand .tag { font-size: 11.5px; color: #8E9993; margin-top: 2px; }
+        .nav-scroll { padding: 10px 8px 24px; flex: 1; }
+        .nav-top-item, .nav-group-head {
+          display: flex; align-items: center; gap: 9px; width: 100%; background: none; border: none;
+          color: #C7CEC9; font-size: 13.5px; padding: 9px 10px; border-radius: 6px; cursor: pointer;
+          text-align: left; font-family: 'Inter', sans-serif;
+        }
+        .nav-top-item.active, .nav-item.active { background: var(--primary); color: #fff; }
+        .nav-top-item:hover, .nav-group-head:hover, .nav-item:hover { background: rgba(255,255,255,0.06); }
+        .nav-group-head { justify-content: space-between; margin-top: 4px; font-weight: 600; }
+        .nav-group-head-left { display:flex; align-items:center; gap:9px; }
+        .nav-items { padding-left: 14px; margin-top: 2px; display: flex; flex-direction: column; gap: 1px; }
+        .nav-item {
+          background: none; border: none; color: #AEB7B1; font-size: 13px; padding: 7px 10px 7px 20px;
+          border-radius: 6px; cursor: pointer; text-align: left; border-left: 2px solid transparent;
+        }
+        .nav-item.active { border-left: 2px solid #fff; }
+        .sidebar-user { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+          padding: 12px 14px; border-top: 1px solid rgba(255,255,255,0.08); }
+        .sidebar-user-info { min-width: 0; }
+        .sidebar-user-email { font-size: 12px; color: #DCE3DF; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sidebar-user-role { font-size: 11px; color: #8E9993; }
+        .sidebar-signout { border-color: rgba(255,255,255,0.15); color: #AEB7B1; flex-shrink: 0; }
+        .sidebar-signout:hover { border-color: #fff; color: #fff; }
+
+        .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+        .topbar {
+          display: flex; align-items: center; justify-content: space-between; gap: 12px;
+          padding: 16px 26px; background: var(--surface); border-bottom: 1px solid var(--line);
+          position: sticky; top: 0; z-index: 5;
+        }
+        .topbar-left { display: flex; align-items: center; gap: 12px; }
+        .hamburger { display: none; background: none; border: 1px solid var(--line); border-radius: 6px; padding: 6px; cursor: pointer; }
+        .page-title { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 24px; }
+        .page-date { font-size: 12.5px; color: var(--muted); }
+        .content { padding: 22px 26px 60px; }
+        .save-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); flex-shrink: 0; }
+        .save-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--primary); }
+        .save-saving .save-dot { background: var(--amber); }
+        .save-error .save-dot { background: var(--red); }
+        @media (max-width: 560px) { .save-indicator span:not(.save-dot) { display: none; } }
+
+        .module { display: flex; flex-direction: column; gap: 18px; }
+        .module-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+        .search-box {
+          display: flex; align-items: center; gap: 7px; background: var(--surface); border: 1px solid var(--line);
+          border-radius: 7px; padding: 7px 11px; min-width: 220px; color: var(--muted);
+        }
+        .search-box input { border: none; outline: none; font-size: 13.5px; width: 100%; background: transparent; color: var(--ink); }
+
+        .btn {
+          display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; font-weight: 600;
+          padding: 8px 14px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; font-family: 'Inter', sans-serif;
+        }
+        .btn-primary { background: var(--primary); color: #fff; }
+        .btn-primary:hover { background: var(--primary-dark); }
+        .btn-ghost { background: transparent; color: var(--primary); border: 1px solid var(--line); }
+        .btn-ghost:hover { background: var(--greenbg); }
+        .btn-small { padding: 5px 10px; font-size: 12.5px; align-self: flex-start; }
+
+        .icon-btn {
+          display: inline-flex; align-items: center; gap: 4px; background: none; border: 1px solid var(--line);
+          border-radius: 6px; padding: 5px 8px; cursor: pointer; color: var(--muted); font-size: 12px;
+        }
+        .icon-btn:hover { border-color: var(--primary); color: var(--primary); }
+        .icon-btn-danger:hover { border-color: var(--red); color: var(--red); }
+
+        .form-card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+        .form-card-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 14px; }
+        .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; padding: 18px 20px 6px; }
+        .form-field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+        .input {
+          font-family: 'Inter', sans-serif; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+          font-size: 13.5px; color: var(--ink); background: var(--surface);
+        }
+        .input-compact { padding: 5px 7px; font-size: 12.5px; }
+        .form-actions { display: flex; align-items: center; gap: 10px; padding: 16px 20px 20px; }
+
+        .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+        table { border-collapse: collapse; width: 100%; font-size: 13px; }
+        th { text-align: left; padding: 10px 14px; background: #F7F8F6; color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--line); white-space: nowrap; }
+        td { padding: 10px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+        tr:last-child td { border-bottom: none; }
+        .actions-col { display: flex; gap: 6px; }
+        .empty-row { text-align: center; color: var(--muted); padding: 20px; font-size: 13px; }
+
+        .badge { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 600; }
+        .badge-green { background: var(--greenbg); color: var(--primary-dark); }
+        .badge-amber { background: var(--amberbg); color: var(--amber); }
+        .badge-red { background: var(--redbg); color: var(--red); }
+        .badge-steel { background: var(--steelbg); color: var(--steel); }
+
+        .kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+        .kpi { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; border-top: 3px solid var(--steel); }
+        .kpi-green { border-top-color: var(--primary); }
+        .kpi-amber { border-top-color: var(--amber); }
+        .kpi-red { border-top-color: var(--red); }
+        .kpi-value { font-family: 'Barlow Condensed', sans-serif; font-size: 30px; font-weight: 700; line-height: 1; }
+        .kpi-label { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+        .kpi-sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; opacity: 0.85; }
+
+        .dash-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+        .dash-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+        .dash-panel-head { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; margin-bottom: 6px; color: var(--ink); }
+        .dash-row { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); }
+        .dash-row:last-of-type { border-bottom: none; }
+        .dash-row-title { font-size: 13px; font-weight: 500; }
+
+        .staff-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+        .staff-card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; }
+        .staff-card-top { display: flex; align-items: center; gap: 10px; }
+        .avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--primary); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+        .staff-name { font-weight: 600; font-size: 14px; }
+        .staff-role { font-size: 12px; color: var(--muted); }
+        .staff-meta { font-size: 12px; color: var(--ink); display: flex; gap: 5px; }
+        .staff-meta.muted { color: var(--muted); }
+        .staff-actions { display: flex; gap: 8px; margin-top: 6px; }
+        .photo-upload { display: flex; align-items: center; gap: 12px; }
+        .photo-upload-actions { display: flex; align-items: center; gap: 8px; }
+        .photo-input-label { cursor: pointer; }
+
+        .att-summary { font-size: 13px; color: var(--muted); }
+        .att-pct { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 20px; color: var(--primary); }
+
+        .complaint-list { display: flex; flex-direction: column; gap: 10px; }
+        .complaint-card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+        .complaint-top { display: flex; justify-content: space-between; align-items: flex-start; }
+        .complaint-id { font-weight: 600; font-size: 13.5px; }
+        .complaint-flow { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+        .flow-step { font-size: 11px; color: var(--muted); background: var(--steelbg); padding: 3px 8px; border-radius: 20px; }
+        .flow-step.flow-done { background: var(--greenbg); color: var(--primary-dark); font-weight: 600; }
+        .flow-arrow { color: var(--line); }
+        .complaint-bottom { display: flex; justify-content: space-between; align-items: center; }
+
+        .report-note { font-size: 12.5px; color: var(--muted); max-width: 560px; }
+
+        @media print {
+          .no-print { display: none !important; }
+          .sidebar, .hamburger, .save-indicator { display: none !important; }
+          .shell { display: block; }
+          .main { width: 100%; }
+          .topbar { position: static; border-bottom: 2px solid var(--ink); }
+          .content { padding: 0; }
+          body { background: #fff; }
+        }
+
+        @media (max-width: 860px) {
+          .sidebar { position: fixed; z-index: 20; left: -260px; transition: left .2s ease; box-shadow: 2px 0 12px rgba(0,0,0,0.2); }
+          .sidebar.open { left: 0; }
+          .hamburger { display: inline-flex; }
+          .content { padding: 16px 14px 50px; }
+          .topbar { padding: 12px 14px; }
+          .page-title { font-size: 20px; }
+          .drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 15; }
+        }
+      `}</style>
+
+      {drawerOpen && <div className="drawer-overlay" onClick={() => setDrawerOpen(false)} />}
+
+      <nav className={`sidebar ${drawerOpen ? "open" : ""}`}>
+        <div className="sidebar-brand">
+          <div className="name brandline">Shiftline</div>
+          <div className="tag">Facility Operations</div>
+        </div>
+        <div className="nav-scroll">
+          {visibleNav.map((n, i) => {
+            if (n.key) {
+              const Icon = n.icon;
+              return (
+                <button key={n.key} className={`nav-top-item ${active === n.key ? "active" : ""}`} onClick={() => { setActive(n.key); setDrawerOpen(false); }}>
+                  <Icon size={16} /> {n.label}
+                </button>
+              );
+            }
+            const Icon = n.icon;
+            const isOpen = openGroups[n.group];
+            return (
+              <div key={n.group}>
+                <button className="nav-group-head" onClick={() => setOpenGroups({ ...openGroups, [n.group]: !isOpen })}>
+                  <span className="nav-group-head-left"><Icon size={16} /> {n.group}</span>
+                  {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                </button>
+                {isOpen && (
+                  <div className="nav-items">
+                    {n.items.map(item => (
+                      <button key={item.key} className={`nav-item ${active === item.key ? "active" : ""}`} onClick={() => { setActive(item.key); setDrawerOpen(false); }}>
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {SUPABASE_CONFIGURED && REQUIRE_LOGIN && session && (
+          <div className="sidebar-user">
+            <div className="sidebar-user-info">
+              <div className="sidebar-user-email">{session.email}</div>
+              <div className="sidebar-user-role">{effectiveRole || "No role"}</div>
+            </div>
+            <button className="icon-btn sidebar-signout" onClick={handleLogout}><LogOut size={13} /></button>
+          </div>
+        )}
+      </nav>
+
+      <div className="main">
+        <div className="topbar">
+          <div className="topbar-left">
+            <button className="hamburger" onClick={() => setDrawerOpen(true)}><Menu size={18} /></button>
+            <div>
+              <div className="page-title brandline">{currentTitle}</div>
+              <div className="page-date">{company.name} &middot; {TODAY}</div>
+            </div>
+          </div>
+          <div className={`save-indicator save-${saveState}`}>
+            <span className="save-dot" /> {{ idle: "Saved", saving: "Saving...", saved: "Saved", error: "Save failed" }[saveState]}
+          </div>
+        </div>
+        <div className="content">{renderContent()}</div>
+      </div>
+    </div>
+  );
+}
